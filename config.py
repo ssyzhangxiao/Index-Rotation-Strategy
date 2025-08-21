@@ -31,9 +31,9 @@ class BacktestConfig:
     max_position_size: float = 0.05  # 每只股票最大仓位5%
     
     # 数据下载配置
-    data_dir: str = "./data"
-    constituents_cache_dir: str = os.path.join("./data", "constituents_cache")
-    price_cache_dir: str = os.path.join("./data", "price_cache")
+    data_dir: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
+    constituents_cache_dir: str = os.path.join(data_dir, "constituents_cache")
+    price_cache_dir: str = os.path.join(data_dir, "price_cache")
     
     # 数据下载日期范围
     data_download_start_date: str = "2010-01-01"

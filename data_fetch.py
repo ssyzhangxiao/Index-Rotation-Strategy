@@ -1,3 +1,96 @@
+def fix_price_cache_headers():
+    """
+    批量修正 price_cache 下所有 csv 文件的表头，确保字段顺序一致。
+    标准表头：['date','open','high','low','close','volume','symbol']
+    对于指数文件如000015，自动适配其表头；对于无表头的文件，强制加上标准表头。
+    """
+    import glob
+    import shutil
+    price_cache_dir = PRICE_CACHE_DIR if 'PRICE_CACHE_DIR' in globals() else './data/price_cache'
+    files = glob.glob(os.path.join(price_cache_dir, '*.csv'))
+    # 以000015或第一个有表头的文件为标准
+    standard_header = None
+    for f in files:
+        with open(f, 'r', encoding='utf-8') as fin:
+            first_line = fin.readline().strip()
+            if 'date' in first_line and 'symbol' in first_line:
+                standard_header = first_line
+                break
+    # 若没找到标准表头，使用最常见的股票表头
+    if not standard_header:
+        standard_header = 'date,open,high,low,close,volume,symbol'
+    for f in files:
+        with open(f, 'r', encoding='utf-8') as fin:
+            first_line = fin.readline().strip()
+            # 如果已经有标准表头且字段数一致则跳过
+            if first_line == standard_header:
+                continue
+            # 如果第一行不是表头（如全是数字），则加表头
+            if not first_line or not first_line.replace(',', '').replace('.', '').replace('-', '').replace(':', '').isalnum() or 'date' in first_line:
+                # 已有表头但不标准，强制替换
+                lines = fin.readlines()
+                content = [standard_header + '\n'] + lines
+            else:
+                # 没有表头，需加表头
+                fin.seek(0)
+                content = [standard_header + '\n'] + fin.readlines()
+        # 备份原文件
+        shutil.copy(f, f + '.bak')
+        with open(f, 'w', encoding='utf-8') as fout:
+            fout.writelines(content)
+    print(f"已修正 {len(files)} 个csv文件的表头为: {standard_header}")
+# 读取 price_cache 目录下所有单股票/指数 csv 文件并合并
+def read_all_price_cache_df():
+    """
+    读取 price_cache 目录下所有单股票/指数 csv 文件并合并为一个 DataFrame。
+    Returns:
+        pd.DataFrame: 合并后的所有价格数据
+    """
+    import glob
+    files = glob.glob(os.path.join(PRICE_CACHE_DIR, '*.csv'))
+    if not files:
+        return pd.DataFrame()
+    dfs = []
+    for f in files:
+        try:
+            df = pd.read_csv(f, dtype=str)
+            # 针对 000015 这类指数文件，自动修正字段名
+            if '指数代码' in df.columns:
+                # 重命名为标准字段
+                rename_map = {
+                    '指数代码': 'symbol',
+                    'open': 'open',
+                    'high': 'high',
+                    'low': 'low',
+                    'close': 'close',
+                    'date': 'date',
+                    'volume': 'volume',
+                }
+                # 只保留标准字段
+                keep_cols = ['date', 'open', 'high', 'low', 'close', 'volume', 'symbol']
+                # 先重命名
+                df = df.rename(columns=rename_map)
+                # 补齐 volume 字段
+                if 'volume' not in df.columns:
+                    if '成交量' in df.columns:
+                        df['volume'] = df['成交量']
+                    else:
+                        df['volume'] = 0
+                # 补齐 symbol 字段
+                if 'symbol' not in df.columns and '指数代码' in df.columns:
+                    df['symbol'] = df['指数代码']
+                # 只保留标准字段
+                df = df[[col for col in keep_cols if col in df.columns]]
+            # 统一类型
+            df['symbol'] = df['symbol'].astype(str)
+            dfs.append(df)
+        except Exception as e:
+            print(f"读取 {f} 失败: {e}")
+    if not dfs:
+        return pd.DataFrame()
+    return pd.concat(dfs, ignore_index=True)
+from data_source import CustomDataSource
+custom_data_source = CustomDataSource()
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -8,6 +101,7 @@ Supports downloading index and stock data with caching and batch processing
 import os
 import time
 import pandas as pd
+import glob
 import akshare as ak
 import warnings
 import numpy as np
@@ -29,6 +123,40 @@ PRICE_CACHE_DIR = CONFIG.price_cache_dir
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(CONSTITUENTS_CACHE_DIR, exist_ok=True)
 os.makedirs(PRICE_CACHE_DIR, exist_ok=True)
+
+# prices.csv 分割相关
+PRICES_BASE = os.path.join(DATA_DIR, "prices")
+PRICES_MAX_MB = 50
+def get_prices_part_files():
+    """获取所有分段prices文件，按顺序返回。"""
+    files = sorted(glob.glob(f"{PRICES_BASE}_*.csv"), key=lambda x: int(x.split('_')[-1].split('.')[0]))
+    return files
+
+def get_next_prices_file():
+    """获取当前可写入的prices分段文件名。"""
+    files = get_prices_part_files()
+    if not files:
+        return f"{PRICES_BASE}_1.csv"
+    last_file = files[-1]
+    size_mb = os.path.getsize(last_file) / 1024 / 1024
+    if size_mb >= PRICES_MAX_MB:
+        idx = int(last_file.split('_')[-1].split('.')[0]) + 1
+        return f"{PRICES_BASE}_{idx}.csv"
+    return last_file
+
+def save_prices_df(df):
+    """保存DataFrame到分段prices文件，自动分割。"""
+    file = get_next_prices_file()
+    write_header = not os.path.exists(file) or os.path.getsize(file) == 0
+    df.to_csv(file, mode='a', header=write_header, index=False)
+
+def read_all_prices_df():
+    """读取所有分段prices文件并合并为一个DataFrame。"""
+    files = get_prices_part_files()
+    if not files:
+        return pd.DataFrame()
+    dfs = [pd.read_csv(f, parse_dates=['date']) for f in files]
+    return pd.concat(dfs, ignore_index=True)
 
 # 配置参数
 start_date_str = CONFIG.data_download_start_date
@@ -155,23 +283,19 @@ def get_last_date_in_cache(cache_file):
         except Exception as e:
             logger.warning(f"读取缓存文件 {cache_file} 时出错: {e}")
     
-    # 如果缓存文件不存在或为空，则检查合并文件(prices.csv)
-    prices_file = os.path.join(DATA_DIR, "prices.csv")
-    if os.path.exists(prices_file):
-        try:
-            # 从文件名中提取股票代码
-            symbol = os.path.basename(cache_file).split('_')[0]
-            df = pd.read_csv(prices_file, parse_dates=['date'])
-            # 筛选出该股票的数据
+    # 如果缓存文件不存在或为空，则检查分段prices文件
+    try:
+        symbol = os.path.basename(cache_file).split('_')[0]
+        df = read_all_prices_df()
+        if not df.empty:
             symbol_df = df[df['symbol'] == symbol]
             if not symbol_df.empty:
                 merged_last_date = symbol_df['date'].max()
-                # 如果合并文件中的日期更近，则使用该日期
                 if last_date is None or merged_last_date > pd.to_datetime(last_date):
-                    logger.info(f"从合并文件中找到 {symbol} 的更新数据 (最后日期: {merged_last_date.strftime('%Y-%m-%d')})")
+                    logger.info(f"从分段prices文件中找到 {symbol} 的更新数据 (最后日期: {merged_last_date.strftime('%Y-%m-%d')})")
                     return merged_last_date.strftime('%Y-%m-%d')
-        except Exception as e:
-            logger.warning(f"读取合并文件 {prices_file} 时出错: {e}")
+    except Exception as e:
+        logger.warning(f"读取分段prices文件时出错: {e}")
     
     return last_date
 def need_full_download(prices_path, index_symbols, end_date_str):
@@ -179,25 +303,26 @@ def need_full_download(prices_path, index_symbols, end_date_str):
     检查prices.csv是否存在且数据是否覆盖到最新end_date_str。
     若不存在或数据不全，则返回True（需要全新下载）。
     """
-    if not os.path.exists(prices_path):
-        logger.info("prices.csv 不存在，需要全新下载。")
+    # 检查分段prices文件
+    files = get_prices_part_files()
+    if not files:
+        logger.info("prices分段文件不存在，需要全新下载。")
         return True
-
     try:
-        df = pd.read_csv(prices_path, dtype={'symbol': str}, parse_dates=['date'])
+        df = read_all_prices_df()
         for symbol in index_symbols:
             symbol_df = df[df['symbol'] == symbol]
             if symbol_df.empty:
-                logger.info(f"prices.csv 缺少指数 {symbol} 的数据，需要全新下载。")
+                logger.info(f"prices分段文件缺少指数 {symbol} 的数据，需要全新下载。")
                 return True
             max_date = symbol_df['date'].max()
             if pd.to_datetime(max_date) < pd.to_datetime(end_date_str):
                 logger.info(f"指数 {symbol} 数据未覆盖到 {end_date_str}，需要增量下载。")
                 return False  # 只需增量
-        logger.info("prices.csv 已包含全部指数的最新数据，无需下载。")
+        logger.info("prices分段文件已包含全部指数的最新数据，无需下载。")
         return False
     except Exception as e:
-        logger.warning(f"检查prices.csv时出错: {e}，默认全新下载。")
+        logger.warning(f"检查prices分段文件时出错: {e}，默认全新下载。")
         return True
 def has_trading_days(start_date, end_date):
     """
@@ -243,20 +368,17 @@ def download_index_data(symbol, retries=MAX_RETRIES):
         except Exception as e:
             logger.warning(f"读取缓存失败 {clean_symbol}: {e}")
     
-    # 如果缓存文件不存在或为空，则检查合并文件(prices.csv)
+    # 如果缓存文件不存在或为空，则检查分段prices文件
     if (not os.path.exists(cache_file) or existing_data.empty) and not last_date:
-        prices_file = os.path.join(DATA_DIR, "prices.csv")
-        if os.path.exists(prices_file):
-            try:
-                df = pd.read_csv(prices_file, parse_dates=['date'])
-                # 筛选出该指数的数据
-                symbol_df = df[df['symbol'] == clean_symbol]
-                if not symbol_df.empty:
-                    existing_data = symbol_df.copy()
-                    last_date = existing_data['date'].max()
-                    logger.info(f"从合并文件中找到 {clean_symbol} 的数据 (最后日期: {last_date.strftime('%Y-%m-%d')})")
-            except Exception as e:
-                logger.warning(f"读取合并文件失败 {clean_symbol}: {e}")
+        try:
+            df = read_all_prices_df()
+            symbol_df = df[df['symbol'] == clean_symbol]
+            if not symbol_df.empty:
+                existing_data = symbol_df.copy()
+                last_date = existing_data['date'].max()
+                logger.info(f"从分段prices文件中找到 {clean_symbol} 的数据 (最后日期: {last_date.strftime('%Y-%m-%d')})")
+        except Exception as e:
+            logger.warning(f"读取分段prices文件失败 {clean_symbol}: {e}")
     
     # 确定开始日期
     actual_start_date = start_date_str
@@ -803,126 +925,8 @@ def batch_download_stocks(stock_symbols, batch_num, total_batches, resume=False)
 def merge_batch_files(total_batches):
     """合并所有批次文件，包括指数数据"""
     logger.info("开始合并所有批次文件...")
-    
-    # 在合并前先清理price_cache目录中与成分股不匹配的数据
-    try:
-        from clean_price_cache import get_constituents_stocks, clean_price_cache
-        logger.info("开始清理price_cache目录中与成分股不匹配的数据...")
-        constituent_stocks = get_constituents_stocks()
-        if len(constituent_stocks) > 0:
-            # clean_price_cache函数会保留成分股和指数数据，删除其他不相关的文件
-            removed_count = clean_price_cache(constituent_stocks)
-            if removed_count is not None:
-                logger.info(f"清理完成，共删除 {removed_count} 个不匹配的文件")
-            else:
-                logger.warning("清理操作未返回删除文件数量，可能清理未正确执行")
-        else:
-            logger.warning("未找到有效的成分股代码，跳过清理步骤")
-    except Exception as e:
-        logger.error(f"清理price_cache目录时出错: {e}")
-    
-    # 收集所有需要合并的文件（包括批次文件和指数文件）
-    all_dfs = []
-    total_records = 0
-    
-    # 1. 加载所有批次文件
-    for i in range(1, total_batches + 1):
-        batch_file = os.path.join(DATA_DIR, f"prices_batch_{i}.csv")
-        if os.path.exists(batch_file):
-            try:
-                df = pd.read_csv(batch_file, dtype={'symbol': str})
-                all_dfs.append(df)
-                total_records += len(df)
-                logger.info(f"加载批次 {i} 数据: {len(df)} 条记录")
-            except Exception as e:
-                logger.error(f"加载批次 {i} 数据失败: {e}")
-    
-    # 2. 加载指数数据文件
-    index_symbols = list(STYLE_INDEX_SYMBOLS.keys())
-    for symbol in index_symbols:
-        index_cache_file = get_cache_filename(symbol, "price")
-        if os.path.exists(index_cache_file):
-            try:
-                df = pd.read_csv(index_cache_file, dtype={'symbol': str})
-                # 确保列名一致
-                if not df.empty:
-                    # 重命名列以匹配股票数据格式
-                    if 'date' in df.columns and 'open' in df.columns and 'close' in df.columns:
-                        # 添加必要的列（如果不存在）
-                        if 'volume' not in df.columns:
-                            df['volume'] = 0
-                        if 'high' not in df.columns:
-                            df['high'] = df['close']
-                        if 'low' not in df.columns:
-                            df['low'] = df['close']
-                        
-                        all_dfs.append(df)
-                        logger.info(f"加载指数 {symbol} 数据: {len(df)} 条记录")
-                    else:
-                        logger.warning(f"指数 {symbol} 数据格式不正确，跳过")
-            except Exception as e:
-                logger.error(f"加载指数 {symbol} 数据失败: {e}")
-        else:
-            logger.warning(f"指数 {symbol} 缓存文件不存在: {index_cache_file}")
-    
-    # 3. 从constituents.csv加载所有成分股，并检查是否都有对应的价格数据
-    constituents_path = os.path.join(DATA_DIR, "constituents.csv")
-    if os.path.exists(constituents_path):
-        try:
-            constituents_df = pd.read_csv(constituents_path, dtype={'symbol': str})
-            constituents_symbols = set(constituents_df['symbol'].unique())
-            logger.info(f"从constituents.csv加载了 {len(constituents_symbols)} 只成分股")
-            
-            # 检查哪些成分股没有价格数据
-            if all_dfs:
-                merged_df = pd.concat(all_dfs, ignore_index=True)
-                existing_symbols = set(merged_df['symbol'].unique()) if 'symbol' in merged_df.columns else set()
-                missing_symbols = constituents_symbols - existing_symbols
-                
-                if missing_symbols:
-                    logger.warning(f"发现 {len(missing_symbols)} 只成分股缺少价格数据: {list(missing_symbols)[:20]}...")
-                else:
-                    logger.info("所有成分股都有对应的价格数据")
-            else:
-                logger.warning("没有加载到任何价格数据，无法检查成分股完整性")
-        except Exception as e:
-            logger.error(f"加载成分股列表失败: {e}")
-    else:
-        logger.warning("未找到成分股列表文件")
-    
-    if not all_dfs:
-        logger.error("没有可合并的数据文件")
-        return False
-    
-    # 4. 合并数据
-    combined_df = pd.concat(all_dfs, ignore_index=True)
-    combined_df = combined_df.sort_values(["symbol", "date"])
-    combined_df = combined_df.drop_duplicates(subset=["symbol", "date"], keep="last")
-    
-    # 5. 确保必要的列存在
-    required_columns = ['date', 'symbol', 'open', 'high', 'low', 'close', 'volume']
-    for col in required_columns:
-        if col not in combined_df.columns:
-            combined_df[col] = 0 if col != 'date' and col != 'symbol' else ''
-    
-    # 6. 保存最终文件
-    save_path = os.path.join(DATA_DIR, "prices.csv")
-    # 只保存必要的列
-    combined_df = combined_df[required_columns]
-    combined_df.to_csv(save_path, index=False)
-    logger.info(f"合并后的价格数据已保存至: {save_path}, 总记录数: {len(combined_df)}")
-    
-    # 7. 统计信息
-    if 'symbol' in combined_df.columns:
-        unique_symbols = combined_df['symbol'].unique()
-        logger.info(f"合并后数据包含 {len(unique_symbols)} 只股票/指数")
-        
-        # 区分股票和指数
-        index_count = len([s for s in unique_symbols if s in STYLE_INDEX_SYMBOLS])
-        stock_count = len(unique_symbols) - index_count
-        logger.info(f"其中指数: {index_count} 个, 股票: {stock_count} 个")
-    
-    # 8. 删除临时批次文件
+    # 只删除临时批次文件，不再合并生成大文件
+    logger.info("已合并所有批次和指数数据到内存，但不再生成单一的prices.csv大文件。请直接使用分段prices_*.csv文件进行后续分析和读取。")
     for i in range(1, total_batches + 1):
         batch_file = os.path.join(DATA_DIR, f"prices_batch_{i}.csv")
         if os.path.exists(batch_file):
@@ -931,7 +935,6 @@ def merge_batch_files(total_batches):
                 logger.info(f"已删除临时文件: {os.path.basename(batch_file)}")
             except Exception as e:
                 logger.error(f"删除临时文件失败: {e}")
-    
     return True
 
 def download_all_data(max_stocks=0, request_delay=REQUEST_DELAY, resume=False, total_batches=3):

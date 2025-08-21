@@ -1,9 +1,13 @@
+from data_fetch import read_all_price_cache_df  # 统一全量读取所有价格数据
 import os
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
 import logging
-import traceback
+from datetime import datetime, timedelta
+import warnings
+
+# 为了解决 FutureWarning 警告，设置 pandas 选项
+pd.set_option('future.no_silent_downcasting', True)
 
 # 导入统一配置
 from config import CONFIG, INDEX_LIST
@@ -66,86 +70,43 @@ def get_top_n_strong_indexes(index_list=None, n=3, selection_date=None):
             logger.info("请求列表中包含000015指数")
         
         try:
-            # 查询指数数据
-            index_data = data_source.query(
-                symbols=index_list,
-                start_date=start_date.strftime('%Y-%m-%d'),
-                end_date=selection_date
-            )
-            
-            logger.info(f"从数据源获取到的指数数据: {len(index_data)} 条记录")
-            if not index_data.empty:
-                logger.info(f"获取到的指数数量: {index_data['symbol'].nunique()}")
-                unique_symbols = list(index_data['symbol'].unique())
-                logger.info(f"获取到的指数代码: {unique_symbols}")
-                
-                # 特别检查000015指数数据
-                index_000015_data = index_data[index_data['symbol'] == "000015"]
-                logger.info(f"000015指数的数据条数: {len(index_000015_data)}")
-                if len(index_000015_data) > 0:
-                    logger.info(f"000015指数的日期范围: {index_000015_data['date'].min()} 至 {index_000015_data['date'].max()}")
-                
-                # 检查每个请求的指数是否有数据
-                for index in index_list:
-                    index_specific_data = index_data[index_data['symbol'] == index]
-                    logger.info(f"指数 {index} 的数据条数: {len(index_specific_data)}")
-                    if len(index_specific_data) > 0:
-                        logger.info(f"指数 {index} 的最新数据日期: {index_specific_data['date'].max()}")
-                    else:
-                        logger.warning(f"指数 {index} 没有匹配到任何数据")
-            else:
-                logger.warning("未能获取到任何指数数据")
-                # 显示请求参数以便调试
-                logger.info(f"请求参数 - 指数列表: {index_list}")
-                logger.info(f"请求参数 - 开始日期: {start_date.strftime('%Y-%m-%d')}")
-                logger.info(f"请求参数 - 结束日期: {selection_date}")
-                
-                # 特别检查数据文件中是否包含000015数据
-                try:
-                    prices_file = os.path.join(DATA_PATH, "prices.csv")
-                    if os.path.exists(prices_file):
-                        # 检查文件中是否有000015数据
-                        import subprocess
-                        result = subprocess.run(["grep", "-c", "000015", prices_file], 
-                                              capture_output=True, text=True)
-                        if result.returncode == 0:
-                            count = int(result.stdout.strip())
-                            logger.info(f"prices.csv文件中000015数据条数: {count}")
-                        else:
-                            logger.warning("无法统计prices.csv文件中000015数据条数")
-                except Exception as e:
-                    logger.error(f"检查prices.csv中000015数据时出错: {e}")
-            
-            if not index_data.empty:
-                # 计算每个指数的RSI5强度
-                index_rsi5_values = {}
-                
-                for symbol in index_list:
-                    symbol_data = index_data[index_data['symbol'] == symbol].copy()
-                    logger.info(f"指数 {symbol} 的数据条数: {len(symbol_data)}")
-                    if len(symbol_data) >= 5:  # 确保有足够的数据计算RSI5
-                        # 获取最近5日收盘价
-                        recent_prices = symbol_data['close'].tail(5).tolist()
-                        logger.info(f"指数 {symbol} 最近5日收盘价: {recent_prices}")
-                        
-                        # 计算RSI5
-                        rsi5 = calc_rsi5(recent_prices)
-                        index_rsi5_values[symbol] = rsi5
-                        
-                        logger.info(f"指数 {symbol} 的RSI5值: {rsi5}")
-                    else:
-                        # 数据不足，给默认评分0
-                        index_rsi5_values[symbol] = 0
-                        logger.warning(f"指数 {symbol} 数据不足，仅 {len(symbol_data)} 条记录")
-                
-                # 按RSI5值排序并返回前n个
-                sorted_indexes = sorted(index_rsi5_values.items(), key=lambda x: x[1], reverse=True)
-                top_indexes = [index for index, _ in sorted_indexes[:n]]
-                logger.info(f"基于RSI5计算的强势指数: {top_indexes}")
-                logger.info(f"各指数RSI5值: {sorted_indexes[:n]}")
-                return top_indexes
-            else:
-                logger.warning("无法获取指数数据")
+            # 直接用分文件方案获取所有指数数据
+            from data_fetch import read_all_price_cache_df
+            df = read_all_price_cache_df()
+            if df.empty:
+                logger.warning("分文件数据为空，无法获取指数数据")
+                return []
+            df['date'] = pd.to_datetime(df['date'])
+            # 只保留请求的指数
+            if index_list:
+                index_list = [str(s).replace('.SH', '').replace('.SZ', '') for s in index_list]
+                df = df[df['symbol'].isin(index_list)]
+            # 日期过滤
+            start_dt = pd.to_datetime(start_date)
+            end_dt = pd.to_datetime(selection_date)
+            df = df[(df['date'] >= start_dt) & (df['date'] <= end_dt)]
+            if df.empty:
+                logger.warning("分文件数据中无匹配日期的指数数据")
+                return []
+            # 计算每个指数的RSI5强度
+            index_rsi5_values = {}
+            for symbol in index_list:
+                symbol_data = df[df['symbol'] == symbol].copy()
+                logger.info(f"指数 {symbol} 的数据条数: {len(symbol_data)}")
+                if len(symbol_data) >= 5:
+                    recent_prices = symbol_data['close'].tail(5).tolist()
+                    logger.info(f"指数 {symbol} 最近5日收盘价: {recent_prices}")
+                    rsi5 = calc_rsi5(recent_prices)
+                    index_rsi5_values[symbol] = rsi5
+                    logger.info(f"指数 {symbol} 的RSI5值: {rsi5}")
+                else:
+                    index_rsi5_values[symbol] = 0
+                    logger.warning(f"指数 {symbol} 数据不足，仅 {len(symbol_data)} 条记录")
+            sorted_indexes = sorted(index_rsi5_values.items(), key=lambda x: x[1], reverse=True)
+            top_indexes = [index for index, _ in sorted_indexes[:n]]
+            logger.info(f"基于RSI5计算的强势指数: {top_indexes}")
+            logger.info(f"各指数RSI5值: {sorted_indexes[:n]}")
+            return top_indexes
         except Exception as e:
             logger.error(f"计算指数强度时出错: {str(e)}")
             logger.exception(e)
@@ -273,11 +234,11 @@ def custom_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df['ma20'] = df['close'].rolling(20, min_periods=1).mean()
         df['ma60'] = df['close'].rolling(60, min_periods=1).mean()
         df['ma200'] = df['close'].rolling(200, min_periods=1).mean()
-        
+
         # 计算角度指标
         df['ma60_angle'] = np.degrees(np.arctan((df['ma60']/df['ma60'].shift(20)-1)*100))
         df['ma200_angle'] = np.degrees(np.arctan((df['ma200']/df['ma200'].shift(20)-1)*100))
-        
+
         # 计算RSI
         delta = df['close'].diff()
         gain = delta.clip(lower=0)
@@ -286,38 +247,39 @@ def custom_indicators(df: pd.DataFrame) -> pd.DataFrame:
         avg_loss = loss.rolling(RSI_PERIOD, min_periods=1).mean()
         rs = np.where(avg_loss != 0, avg_gain / avg_loss, np.inf)
         df['rsi6'] = 100 - (100 / (1 + rs))
-        
+
         # 计算威廉指标 (Williams %R)
         highest_high = df['high'].rolling(14, min_periods=1).max()
         lowest_low = df['low'].rolling(14, min_periods=1).min()
         df['williams_r'] = (highest_high - df['close']) / (highest_high - lowest_low) * -100
-        
+
         # 计算量比
         df['vol_ma5'] = df['volume'].rolling(5, min_periods=1).mean()
         df['vol_ratio'] = df['volume'] / df['vol_ma5']
-        
+
         # 计算偏离度
         df['deviation'] = abs(df['close'] - df['ma5']) / df['ma5']
-        
+
         # 计算均线斜率
         df['ma5_slope'] = (df['ma5'] - df['ma5'].shift(4)) / df['ma5'] / 5
         df['ma200_slope'] = (df['ma200'] - df['ma200'].shift(20)) / df['ma200'] / 20
-        
+
         # 计算10日涨跌幅
         df['pct_10d'] = df['close'].pct_change(10)
-        
+
         # 增加MACD指标
         exp12 = df['close'].ewm(span=12, adjust=False).mean()
         exp26 = df['close'].ewm(span=26, adjust=False).mean()
         df['macd'] = exp12 - exp26
         df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-        
+
         # 计算近期最低价（用于止损）
         df['low_10d'] = df['low'].rolling(10, min_periods=1).min()
-        
-        # 处理NaN值
+
+        # 处理缺失值
         df = df.fillna(0)
-        
+        # 为避免 FutureWarning，使用 infer_objects() 处理可能的 downcasting
+        df = df.infer_objects()
         return df
     except Exception as e:
         logger.error(f"指标计算失败: {str(e)}")
@@ -346,29 +308,94 @@ def load_index_components(index_code: str) -> list[str]:
 def _get_stock_data(all_symbols: set, end_date=None) -> pd.DataFrame:
     """获取股票数据"""
     logger.info(f"正在获取选股数据(200天)...")
+    logger.info(f"请求的股票数量: {len(all_symbols)}")
+    logger.info(f"前10个请求的股票代码: {list(all_symbols)[:10]}")
     
     # 如果提供了结束日期，则基于该日期往前推200天获取数据
+    from data_fetch import read_all_price_cache_df
+    df = read_all_price_cache_df()
+    if df.empty:
+        logger.error("分文件数据为空，无法获取股票数据")
+        return pd.DataFrame()
+    
+    logger.info(f"从文件中读取到的总数据量: {len(df)}")
+    logger.info(f"数据中的唯一股票数量: {df['symbol'].nunique() if 'symbol' in df.columns else '无symbol列'}")
+    if 'symbol' in df.columns:
+        logger.info(f"数据中的前10个股票代码: {list(df['symbol'].unique()[:10])}")
+    
+    df['date'] = pd.to_datetime(df['date'])
+    
     if end_date:
-        # 计算开始日期
         end_date_obj = datetime.strptime(end_date, '%Y-%m-%d')
         start_date = end_date_obj - timedelta(days=200)
+        logger.info(f"请求日期范围: {start_date} 至 {end_date_obj}")
         
-        # 直接从数据源查询数据
-        df = data_source.query(
-            symbols=list(all_symbols),
-            start_date=start_date.strftime('%Y-%m-%d'),
-            end_date=end_date,
-            timeframe='1d',
-            adjust=''
-        )
+        # 处理股票代码类型和格式不匹配问题
+        # 将请求的股票代码转换为与数据中相同的格式（去除前导零并转换为整数）
+        processed_symbols = set()
+        for symbol in all_symbols:
+            try:
+                # 去除前导零并转换为整数
+                processed_symbol = int(symbol)
+                processed_symbols.add(processed_symbol)
+            except ValueError:
+                # 如果无法转换为整数，保留原样
+                processed_symbols.add(symbol)
+        
+        logger.info(f"处理后的股票代码格式，前10个: {list(processed_symbols)[:10]}")
+        
+        # 先过滤股票代码
+        logger.info("开始过滤股票代码...")
+        df_symbol_filtered = df[df['symbol'].isin(processed_symbols)]
+        logger.info(f"按股票代码过滤后的数据量: {len(df_symbol_filtered)}")
+        if not df_symbol_filtered.empty:
+            logger.info(f"过滤后的唯一股票数量: {df_symbol_filtered['symbol'].nunique()}")
+        
+        # 再过滤日期范围
+        logger.info("开始过滤日期范围...")
+        df = df_symbol_filtered[(df_symbol_filtered['date'] >= start_date) & (df_symbol_filtered['date'] <= end_date_obj)]
+        
+        # 如果按精确日期范围过滤后没有数据，尝试放宽条件
+        if df.empty:
+            logger.info("精确日期范围内无数据，尝试放宽条件...")
+            # 查找最接近请求日期范围的数据
+            min_date = df_symbol_filtered['date'].min() if not df_symbol_filtered.empty else None
+            max_date = df_symbol_filtered['date'].max() if not df_symbol_filtered.empty else None
+            
+            if min_date is not None and max_date is not None:
+                logger.info(f"过滤后数据的实际日期范围: {min_date} 至 {max_date}")
+                
+                # 如果请求的结束日期早于数据最早日期或请求的开始日期晚于数据最晚日期，则确实无数据
+                if end_date_obj < min_date or start_date > max_date:
+                    logger.warning("请求日期范围与实际数据日期范围无重叠")
+                else:
+                    # 否则使用实际可用的数据范围
+                    actual_start = max(start_date, min_date)
+                    actual_end = min(end_date_obj, max_date)
+                    logger.info(f"调整日期范围为: {actual_start} 至 {actual_end}")
+                    df = df_symbol_filtered[(df_symbol_filtered['date'] >= actual_start) & (df_symbol_filtered['date'] <= actual_end)]
     else:
-        df = data_source.load_stock_data(list(all_symbols), days=200)
+        # 处理股票代码类型和格式不匹配问题
+        # 将请求的股票代码转换为与数据中相同的格式（去除前导零并转换为整数）
+        processed_symbols = set()
+        for symbol in all_symbols:
+            try:
+                # 去除前导零并转换为整数
+                processed_symbol = int(symbol)
+                processed_symbols.add(processed_symbol)
+            except ValueError:
+                # 如果无法转换为整数，保留原样
+                processed_symbols.add(symbol)
+        
+        df = df[df['symbol'].isin(processed_symbols)]
     
     if df is None or df.empty:
         logger.error("无法获取股票数据")
         return pd.DataFrame()
     
     logger.info(f"成功获取股票数据，共{len(df)}条记录")
+    if not df.empty:
+        logger.info(f"数据中的唯一股票数量: {df['symbol'].nunique()}")
     return df
 
 def _filter_stocks(df: pd.DataFrame) -> pd.DataFrame:
@@ -659,11 +686,9 @@ def save_selected_stocks(selected_df, selection_date=None):
     try:
         selected_df = selected_df.copy()
         selected_df['date'] = selection_date or datetime.today().strftime('%Y-%m-%d')
-        
-        data_dir = './data'
+        data_dir = CONFIG.data_dir
         if not os.path.exists(data_dir):
             os.makedirs(data_dir)
-        
         file_path = os.path.join(data_dir, 'selected_stocks.csv')
         selected_df.to_csv(file_path, index=False)
         logger.info(f"选股结果已保存到: {file_path}")
